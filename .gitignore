@@ -6,3 +6,7 @@ data.db
 logs/
 *.xlsx
 .venv/
+build/
+dist/
+.build-venv/
+*.spec

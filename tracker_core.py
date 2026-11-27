@@ -32,7 +32,12 @@ import datetime as dt
 from collections import OrderedDict, defaultdict
 
 APP_NAME = "VJ-TimesheetTracker"
-CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+__version__ = "1.1.0"
+REPO_URL = "https://github.com/codewithvj-dev/VJ-TimesheetTracker"
+FROZEN = getattr(sys, "frozen", False)  # True when running as the packaged .exe
+CODE_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
+INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Programs", APP_NAME)
+INSTALLED_EXE = os.path.join(INSTALL_DIR, f"{APP_NAME}.exe")
 HOME = os.environ.get("VJTT_HOME") or os.path.join(
     os.environ.get("APPDATA") or os.path.expanduser("~"), APP_NAME)
 os.makedirs(HOME, exist_ok=True)
@@ -629,25 +634,38 @@ def export_excel(path, date_from, date_to, project=None):
 
 
 # ---------------------------------------------------------------- schedule
-def set_schedule(hhmm):
+def _ps(script):
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, creationflags=NO_WINDOW)
+
+
+def _q(s):
+    return s.replace("'", "''")
+
+
+def set_schedule(hhmm, exe=None):
     """(Re)create the daily Windows scheduled task. Runs missed jobs at next logon/boot."""
     dt.datetime.strptime(hhmm, "%H:%M")
-    pyw = os.path.join(os.path.dirname(os.path.realpath(sys.executable)), "pythonw.exe")
-    if not os.path.exists(pyw):
-        pyw = sys.executable
-    script = os.path.join(CODE_DIR, "daily_update.py")
-    q = lambda s: s.replace("'", "''")
+    if FROZEN:
+        execute = exe or sys.executable
+        argument = "--daily-update"
+        workdir = os.path.dirname(execute)
+    else:
+        execute = os.path.join(os.path.dirname(os.path.realpath(sys.executable)), "pythonw.exe")
+        if not os.path.exists(execute):
+            execute = sys.executable
+        argument = f'"{os.path.join(CODE_DIR, "daily_update.py")}"'
+        workdir = CODE_DIR
     ps = (
-        f"$a = New-ScheduledTaskAction -Execute '{q(pyw)}' -Argument '\"{q(script)}\"' "
-        f"-WorkingDirectory '{q(CODE_DIR)}';"
+        f"$a = New-ScheduledTaskAction -Execute '{_q(execute)}' -Argument '{_q(argument)}' "
+        f"-WorkingDirectory '{_q(workdir)}';"
         f"$t = New-ScheduledTaskTrigger -Daily -At '{hhmm}';"
         "$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries "
         "-DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 30);"
         f"Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $a -Trigger $t -Settings $s "
         "-Description 'Collects git commits/pushes for timesheet' -Force | Out-Null"
     )
-    r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
-                       creationflags=NO_WINDOW)
+    r = _ps(ps)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "Could not create scheduled task")
     cfg = load_config()
@@ -656,9 +674,88 @@ def set_schedule(hhmm):
 
 
 def remove_schedule():
-    subprocess.run(["powershell", "-NoProfile", "-Command",
-                    f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false -ErrorAction SilentlyContinue"],
-                   capture_output=True, creationflags=NO_WINDOW)
+    _ps(f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false -ErrorAction SilentlyContinue")
+
+
+def run_daily_update():
+    """What the scheduled task runs: rescan everything, append to logs/YYYY-MM.log."""
+    import traceback
+    os.makedirs(LOGS, exist_ok=True)
+    with open(os.path.join(LOGS, dt.date.today().strftime("%Y-%m") + ".log"), "a", encoding="utf-8") as f:
+        stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            update_all(log=lambda m: f.write(f"{stamp} {m}\n"))
+            f.write(f"{stamp} update OK\n")
+        except Exception:  # noqa: BLE001 - logged for the user
+            f.write(f"{stamp} update FAILED\n{traceback.format_exc()}\n")
+
+
+def git_available():
+    try:
+        return subprocess.run(["git", "--version"], capture_output=True, creationflags=NO_WINDOW).returncode == 0
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- exe install / uninstall
+_UNINSTALL_KEY = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_NAME}"
+
+
+def _shortcut_paths():
+    r = _ps("[Environment]::GetFolderPath('Desktop'); [Environment]::GetFolderPath('Programs')")
+    return [os.path.join(p.strip(), f"{APP_NAME}.lnk") for p in r.stdout.splitlines() if p.strip()]
+
+
+def is_installed_copy():
+    return FROZEN and os.path.normcase(os.path.abspath(sys.executable)) == os.path.normcase(INSTALLED_EXE)
+
+
+def install_self():
+    """Packaged exe only: copy to %LOCALAPPDATA%\\Programs, add shortcuts, daily task, Apps & features entry."""
+    import shutil
+    import winreg
+    if not FROZEN:
+        raise RuntimeError("install_self() is for the packaged .exe; use install.ps1 for the source version.")
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    if not is_installed_copy():
+        try:
+            shutil.copy2(sys.executable, INSTALLED_EXE)
+        except PermissionError:
+            raise RuntimeError(f"{APP_NAME} is already running from {INSTALL_DIR}. Close it and try again.")
+    for lnk in _shortcut_paths():
+        r = _ps(f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{_q(lnk)}');"
+                f"$s.TargetPath='{_q(INSTALLED_EXE)}';$s.WorkingDirectory='{_q(INSTALL_DIR)}';"
+                f"$s.IconLocation='{_q(INSTALLED_EXE)},0';$s.Description='Timesheet from your git commits';$s.Save()")
+        if r.returncode != 0:
+            raise RuntimeError(f"Could not create shortcut {lnk}: {r.stderr.strip()}")
+    set_schedule(load_config()["daily_time"], exe=INSTALLED_EXE)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _UNINSTALL_KEY) as k:
+        for name, val in [("DisplayName", APP_NAME), ("DisplayVersion", __version__), ("Publisher", "codewithvj"),
+                          ("DisplayIcon", f"{INSTALLED_EXE},0"), ("InstallLocation", INSTALL_DIR),
+                          ("URLInfoAbout", REPO_URL), ("UninstallString", f'"{INSTALLED_EXE}" --uninstall')]:
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, val)
+        winreg.SetValueEx(k, "NoModify", 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(k, "NoRepair", 0, winreg.REG_DWORD, 1)
+    return INSTALLED_EXE
+
+
+def uninstall_self(remove_data=False):
+    """Remove task, shortcuts, Apps & features entry; delete the program folder once this process exits."""
+    import winreg
+    remove_schedule()
+    for lnk in _shortcut_paths():
+        try:
+            os.remove(lnk)
+        except OSError:
+            pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _UNINSTALL_KEY)
+    except OSError:
+        pass
+    targets = [INSTALL_DIR] + ([HOME] if remove_data else [])
+    rm = " & ".join(f'rmdir /s /q "{t}"' for t in targets)
+    subprocess.Popen(f'cmd /c timeout /t 3 /nobreak >nul & {rm}', shell=True, creationflags=NO_WINDOW,
+                     cwd=os.environ.get("TEMP") or None)
 
 
 # ---------------------------------------------------------------- CLI

@@ -6,6 +6,8 @@ Update now: rescan everything (also runs daily via Task Scheduler).
 Download: Excel timesheet for a date range and project.
 """
 import os
+import subprocess
+import sys
 import threading
 import webbrowser
 import datetime as dt
@@ -281,7 +283,8 @@ class GitHubReposDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(core.APP_NAME)
+        self.title(f"{core.APP_NAME} {core.__version__}")
+        self._set_icon()
         self.geometry("1150x720")
         self.minsize(950, 580)
         style = ttk.Style(self)
@@ -360,11 +363,98 @@ class App(tk.Tk):
         ttk.Button(sf, text="Change daily time…", command=self.change_schedule).pack(side="right")
         ttk.Button(sf, text="Change start date…", command=self.change_since).pack(side="right", padx=6)
         ttk.Button(sf, text="Open data folder", command=lambda: os.startfile(core.HOME)).pack(side="right")
+        ttk.Button(sf, text="About", command=self.about).pack(side="right", padx=6)
 
         self.load_projects()
-        if not core.load_config()["projects"]:
-            self.after(300, self.welcome)
+        self.after(200, self.startup_checks)
         self.update_now()
+
+    def _set_icon(self):
+        try:
+            if core.FROZEN:
+                self.iconbitmap(default=sys.executable)
+            else:
+                ico = os.path.join(core.CODE_DIR, "assets", "icon.ico")
+                if os.path.exists(ico):
+                    self.iconbitmap(default=ico)
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------ first run / install
+    def startup_checks(self):
+        if core.FROZEN and not core.is_installed_copy() and "--portable" not in sys.argv:
+            if self.offer_install():
+                return
+        if not core.git_available():
+            self.offer_git()
+        if not core.load_config()["projects"]:
+            self.welcome()
+
+    def offer_install(self):
+        """Returns True if the installed copy was launched and this window is closing."""
+        upgrade = os.path.exists(core.INSTALLED_EXE)
+        msg = (f"Update the installed {core.APP_NAME} to version {core.__version__}?" if upgrade else
+               f"Install {core.APP_NAME} on this PC?\n\n"
+               "• Adds Desktop and Start Menu shortcuts\n"
+               "• Turns on the daily automatic update\n"
+               "• Appears in Settings › Apps, where you can uninstall it\n\n"
+               "No admin rights needed. Choose No to just run it once from here.")
+        if not messagebox.askyesno(core.APP_NAME, msg, parent=self):
+            return False
+        try:
+            exe = core.install_self()
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror(core.APP_NAME, str(e), parent=self)
+            return False
+        messagebox.showinfo(core.APP_NAME, f"Installed. {core.APP_NAME} will now open from your Start Menu "
+                            "location.\nYou can delete the downloaded file.", parent=self)
+        subprocess.Popen([exe], cwd=core.INSTALL_DIR, close_fds=True)
+        self.destroy()
+        return True
+
+    def offer_git(self):
+        msg = ("Git for Windows isn't installed (or isn't on PATH).\n\n"
+               "Local projects need it. GitHub projects (connected through 'Git accounts…') work without it.\n\n"
+               "Install Git now?")
+        if not messagebox.askyesno(core.APP_NAME, msg, parent=self):
+            return
+        if subprocess.run(["where", "winget"], capture_output=True, creationflags=core.NO_WINDOW).returncode == 0:
+            subprocess.Popen('start "Install Git" cmd /c "winget install --id Git.Git -e --source winget '
+                             '& echo. & echo Done - restart VJ-TimesheetTracker. & pause"', shell=True)
+        else:
+            webbrowser.open("https://git-scm.com/download/win")
+
+    def about(self):
+        d = tk.Toplevel(self)
+        d.title(f"About {core.APP_NAME}")
+        d.transient(self)
+        d.resizable(False, False)
+        f = ttk.Frame(d, padding=16)
+        f.pack()
+        ttk.Label(f, text=f"{core.APP_NAME} {core.__version__}", style="H.TLabel").pack(anchor="w")
+        mode = ("Installed in " + core.INSTALL_DIR if core.is_installed_copy() else
+                "Portable (not installed)" if core.FROZEN else "Running from source: " + core.CODE_DIR)
+        ttk.Label(f, justify="left", text=(
+            "Fill your timesheet from your git history.\n\n"
+            f"{mode}\nYour data: {core.HOME}\nGit: {'found' if core.git_available() else 'NOT found'}")
+        ).pack(anchor="w", pady=8)
+        b = ttk.Frame(f)
+        b.pack(fill="x")
+        ttk.Button(b, text="Project page / help", command=lambda: webbrowser.open(core.REPO_URL)).pack(side="left")
+        if core.is_installed_copy():
+            ttk.Button(b, text="Uninstall…", command=lambda: (d.destroy(), self.uninstall())).pack(side="left", padx=6)
+        ttk.Button(b, text="Close", command=d.destroy).pack(side="right")
+
+    def uninstall(self):
+        ans = messagebox.askyesnocancel(
+            f"Uninstall {core.APP_NAME}", "Remove the app, shortcuts and daily task?\n\n"
+            "Yes = also delete my saved timesheet data and GitHub tokens\n"
+            "No = keep my data (reinstalling later picks it up again)", parent=self)
+        if ans is None:
+            return
+        core.uninstall_self(remove_data=ans)
+        messagebox.showinfo(core.APP_NAME, "Uninstalled.", parent=self)
+        self.destroy()
 
     # ------------------------------------------------ helpers
     def set_status(self, extra=""):
@@ -384,6 +474,8 @@ class App(tk.Tk):
         self.set_status()
 
     def welcome(self):
+        if not self.winfo_exists():
+            return
         cfg = core.load_config()
         acc = cfg["accounts"]
         who = (f"Your git account '{acc[0]['label']}' ({', '.join(acc[0]['emails'])}) was detected."
@@ -562,5 +654,24 @@ class App(tk.Tk):
         self.set_status()
 
 
-if __name__ == "__main__":
+def main():
+    if "--daily-update" in sys.argv:  # what the scheduled task runs; no window
+        core.run_daily_update()
+        return
+    if "--uninstall" in sys.argv:  # Settings › Apps › Uninstall
+        root = tk.Tk()
+        root.withdraw()
+        ans = messagebox.askyesnocancel(
+            f"Uninstall {core.APP_NAME}", "Remove the app, shortcuts and daily task?\n\n"
+            "Yes = also delete my saved timesheet data and GitHub tokens\n"
+            "No = keep my data", parent=root)
+        if ans is not None:
+            core.uninstall_self(remove_data=ans)
+            messagebox.showinfo(core.APP_NAME, "Uninstalled.", parent=root)
+        root.destroy()
+        return
     App().mainloop()
+
+
+if __name__ == "__main__":
+    main()
