@@ -32,7 +32,8 @@
 11. [Where your data is & privacy](#where-your-data-is--privacy)
 12. [Troubleshooting](#troubleshooting)
 13. [Update / uninstall](#update--uninstall)
-14. [License](#license)
+14. [Build the .exe yourself](#build-the-exe-yourself)
+15. [License](#license)
 
 ## Features
 
@@ -53,10 +54,28 @@
 | What | Why |
 |---|---|
 | Windows 10 / 11 | Uses Task Scheduler and Windows encryption (DPAPI) |
-| [Python 3.9+](https://www.python.org/downloads/) | Runs the app. Tick **"Add python.exe to PATH"** in the installer. tkinter is included by default |
-| [Git for Windows](https://git-scm.com/download/win) | Reads local repos |
+| [Git for Windows](https://git-scm.com/download/win) | Reads local repos. Not needed if you only track GitHub repos. The app offers to install it if it's missing |
+| [Python 3.9+](https://www.python.org/downloads/) | **Only for option B** (running from source). The `.exe` has Python built in |
 
 ## Install
+
+### Option A: download the app (recommended, no setup)
+
+1. Download **[VJ-TimesheetTracker.exe](https://github.com/codewithvj-dev/VJ-TimesheetTracker/releases/latest/download/VJ-TimesheetTracker.exe)** from the [latest release](https://github.com/codewithvj-dev/VJ-TimesheetTracker/releases/latest).
+2. Double-click it and answer **Yes** to *"Install VJ-TimesheetTracker on this PC?"*. No admin rights are needed. Installing:
+   - copies the app to `%LOCALAPPDATA%\Programs\VJ-TimesheetTracker`
+   - adds **Desktop** and **Start Menu** shortcuts
+   - turns on the daily update
+   - adds it to **Settings › Apps**
+3. You can delete the downloaded file afterwards. Answer **No** instead to just run it once without installing.
+
+> **"Windows protected your PC"?** The app isn't code-signed yet, so Windows SmartScreen warns about any new download. Click **More info → Run anyway**. To check that the file is genuine, compare its SHA-256 with `SHA256SUMS.txt` from the same release:
+> `Get-FileHash .\VJ-TimesheetTracker.exe`
+
+**Update:** download the newer `.exe` and run it. It offers to update the installed copy and keeps your data.
+**Uninstall:** use **Settings › Apps › VJ-TimesheetTracker › Uninstall**, or **About → Uninstall…** in the app. You can choose to keep or delete your data.
+
+### Option B: run from source (for developers)
 
 Open **PowerShell** and run:
 
@@ -220,7 +239,7 @@ python tracker_core.py unschedule
 
 | | |
 |---|---|
-| Program | The folder you cloned (contains no personal data) |
+| Program | App: `%LOCALAPPDATA%\Programs\VJ-TimesheetTracker`. Source: the folder you cloned. Neither holds personal data |
 | Your data | `%APPDATA%\VJ-TimesheetTracker\`: `config.json` (accounts, projects, settings), `data.db` (commits & pushes), `logs\` |
 | Move the data | Set the environment variable `VJTT_HOME` to another folder |
 | GitHub tokens | Encrypted with Windows DPAPI for your user, stored in `config.json`. Unreadable by other users or on another PC |
@@ -242,7 +261,9 @@ python tracker_core.py unschedule
 
 ## Update / uninstall
 
-**Update** to the latest version. Your data is untouched:
+**App (.exe):** to update, run the newer `.exe` from the [latest release](https://github.com/codewithvj-dev/VJ-TimesheetTracker/releases/latest). To uninstall, use **Settings › Apps**. Either way your data is kept unless you choose to delete it.
+
+**Source install:** update to the latest version with the commands below. Your data is untouched:
 
 ```powershell
 cd "$HOME\VJ-TimesheetTracker"
@@ -255,6 +276,17 @@ git pull
 powershell -ExecutionPolicy Bypass -File uninstall.ps1              # removes task + shortcuts, keeps data
 powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveData  # also deletes your data and tokens
 ```
+
+## Build the .exe yourself
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_exe.ps1
+```
+
+This builds `dist\VJ-TimesheetTracker.exe` and `dist\SHA256SUMS.txt`:
+- It uses PyInstaller in an isolated `.build-venv`, so your own Python is untouched.
+- The version number comes from `__version__` in `tracker_core.py`.
+- The exe runs the window by default, `--daily-update` headless (what the scheduled task runs), `--portable` to skip the install prompt, and `--uninstall`.
 
 ## License
 
