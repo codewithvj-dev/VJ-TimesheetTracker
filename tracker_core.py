@@ -1,17 +1,33 @@
-"""VJ-TimesheetTracker core: scans git repos, stores commits/pushes, exports Excel.
+"""VJ-TimesheetTracker core: collects your commits/pushes, stores them, exports Excel.
+
+Sources
+  local   - a folder on disk; every git repo in it (and 2 levels below) is scanned
+  github  - repos on GitHub read through a connected account (no clone needed)
+
+Git accounts
+  One or more identities (work, personal, ...). Each has the emails you commit
+  with and can optionally be connected to GitHub with a personal access token.
+  The token is encrypted with Windows DPAPI, so only your Windows user can read it.
 
 Your data lives in %APPDATA%\\VJ-TimesheetTracker (override with VJTT_HOME),
 never in the program folder:
-  config.json  - projects, start date, daily schedule time
+  config.json  - accounts, projects, start date, daily schedule time
   data.db      - SQLite store of every commit and push seen (kept forever,
                  so push history survives git's ~90-day reflog expiry)
   logs/        - daily update logs
 """
+import base64
+import ctypes
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
+import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 import datetime as dt
 from collections import OrderedDict, defaultdict
 
@@ -24,53 +40,55 @@ CONFIG = os.path.join(HOME, "config.json")
 DB = os.path.join(HOME, "data.db")
 LOGS = os.path.join(HOME, "logs")
 TASK_NAME = f"{APP_NAME} Daily Update"
+GITHUB_API = "https://api.github.com"
 SKIP_DIRS = {"node_modules", "vendor", ".git", "dist", "build", "storage", ".venv", "venv"}
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
-DEFAULT_CONFIG = {"since": f"{dt.date.today().year - 1}-01-01", "daily_time": "19:00", "projects": []}
+DEFAULT_CONFIG = {"since": f"{dt.date.today().year - 1}-01-01", "daily_time": "19:00",
+                  "accounts": [], "projects": []}
 
 
 # ---------------------------------------------------------------- config
 def load_config():
     if not os.path.exists(CONFIG):
-        save_config(DEFAULT_CONFIG)
+        save_config(json.loads(json.dumps(DEFAULT_CONFIG)))
     with open(CONFIG, encoding="utf-8") as f:
         cfg = json.load(f)
+    changed = False
     for k, v in DEFAULT_CONFIG.items():
-        cfg.setdefault(k, v)
+        if k not in cfg:
+            cfg[k] = json.loads(json.dumps(v))
+            changed = True
+    for p in cfg["projects"]:
+        if "type" not in p:
+            p["type"] = "local"
+            changed = True
+    if not cfg.get("accounts_initialized"):
+        # first run: create a default account from git's global identity + existing project emails
+        emails = []
+        g = git(None, "config", "--global", "user.email").strip().lower()
+        for e in ([g] if g else []) + [e for p in cfg["projects"] for e in p.get("emails", [])]:
+            if e and e not in emails:
+                emails.append(e)
+        if emails and not cfg["accounts"]:
+            name = git(None, "config", "--global", "user.name").strip() or "Me"
+            cfg["accounts"].append({"id": _new_id(), "label": name, "emails": emails, "github": None})
+        cfg["accounts_initialized"] = True
+        changed = True
+    if changed:
+        save_config(cfg)
     return cfg
 
 
 def save_config(cfg):
-    with open(CONFIG, "w", encoding="utf-8", newline="\n") as f:
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG)
 
 
-def add_project(name, path, emails=None):
-    cfg = load_config()
-    path = os.path.normpath(path)
-    if any(os.path.normcase(p["path"]) == os.path.normcase(path) for p in cfg["projects"]):
-        raise ValueError("This folder is already added.")
-    if any(p["name"].lower() == name.lower() for p in cfg["projects"]):
-        raise ValueError("A project with this name already exists.")
-    repos = find_repos(path)
-    if not repos:
-        raise ValueError("No git repository found in this folder (or 2 levels below it).")
-    if not emails:
-        emails = detect_emails(repos)
-    cfg["projects"].append({"name": name, "path": path, "emails": emails})
-    save_config(cfg)
-    return repos, emails
-
-
-def remove_project(name, delete_data=False):
-    cfg = load_config()
-    cfg["projects"] = [p for p in cfg["projects"] if p["name"] != name]
-    save_config(cfg)
-    if delete_data:
-        with db() as c:
-            c.execute("DELETE FROM commits WHERE project=?", (name,))
-            c.execute("DELETE FROM pushes WHERE project=?", (name,))
+def _new_id():
+    return uuid.uuid4().hex[:8]
 
 
 def set_since(date_iso):
@@ -83,19 +101,304 @@ def set_since(date_iso):
         c.execute("DELETE FROM commits WHERE date < ?", (date_iso,))
 
 
+# ---------------------------------------------------------------- accounts
+def get_account(account_id, cfg=None):
+    cfg = cfg or load_config()
+    for a in cfg["accounts"]:
+        if a["id"] == account_id:
+            return a
+    raise ValueError("Account not found.")
+
+
+def add_account(label, emails):
+    cfg = load_config()
+    label = label.strip()
+    if not label:
+        raise ValueError("Give the account a name, e.g. Work or Personal.")
+    if any(a["label"].lower() == label.lower() for a in cfg["accounts"]):
+        raise ValueError("An account with this name already exists.")
+    acc = {"id": _new_id(), "label": label, "emails": _clean_emails(emails), "github": None}
+    cfg["accounts"].append(acc)
+    save_config(cfg)
+    return acc
+
+
+def update_account(account_id, label=None, emails=None):
+    cfg = load_config()
+    a = get_account(account_id, cfg)
+    if label is not None and label.strip():
+        a["label"] = label.strip()
+    if emails is not None:
+        a["emails"] = _clean_emails(emails)
+    save_config(cfg)
+
+
+def remove_account(account_id):
+    cfg = load_config()
+    users = [p["name"] for p in cfg["projects"] if p.get("account") == account_id]
+    if users:
+        raise ValueError("Remove these GitHub projects first: " + ", ".join(users))
+    cfg["accounts"] = [a for a in cfg["accounts"] if a["id"] != account_id]
+    save_config(cfg)
+
+
+def all_account_emails(cfg=None):
+    cfg = cfg or load_config()
+    out = []
+    for a in cfg["accounts"]:
+        for e in a.get("emails", []):
+            if e not in out:
+                out.append(e)
+    return out
+
+
+def _clean_emails(emails):
+    if isinstance(emails, str):
+        emails = emails.replace(";", ",").split(",")
+    out = []
+    for e in emails or []:
+        e = e.strip().lower()
+        if e and e not in out:
+            out.append(e)
+    return out
+
+
+# ---------------------------------------------------------------- token encryption (Windows DPAPI)
+class _Blob(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _dpapi(data, protect):
+    if os.name != "nt":
+        raise RuntimeError("Saving a GitHub token needs Windows (DPAPI).")
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    buf = ctypes.create_string_buffer(data, len(data))
+    ent_raw = APP_NAME.encode()
+    ent_buf = ctypes.create_string_buffer(ent_raw, len(ent_raw))
+    blob_in = _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_ent = _Blob(len(ent_raw), ctypes.cast(ent_buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _Blob()
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(blob_in), None, ctypes.byref(blob_ent), None, None, 0x1, ctypes.byref(blob_out)):
+        raise RuntimeError("Windows could not " + ("encrypt" if protect else "decrypt") + " the token.")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+
+
+def encrypt_token(token):
+    return base64.b64encode(_dpapi(token.encode(), True)).decode()
+
+
+def decrypt_token(blob):
+    return _dpapi(base64.b64decode(blob), False).decode()
+
+
+# ---------------------------------------------------------------- GitHub API
+class GitHubError(Exception):
+    pass
+
+
+def _gh(api, token, path, params=None, paginate=False, max_pages=50):
+    url = api.rstrip("/") + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": APP_NAME,
+               "X-GitHub-Api-Version": "2022-11-28"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    items, pages = [], 0
+    while url and pages < max_pages:
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8"))
+                link = r.headers.get("Link", "")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise GitHubError("GitHub rejected the token (401). Reconnect the account with a new token.")
+            if e.code == 403:
+                raise GitHubError("GitHub refused access (403): rate limit, SSO authorisation "
+                                  "or missing token permission.")
+            if e.code == 404:
+                raise GitHubError(f"Not found or no access (404): {path}")
+            if e.code == 409:  # empty repository
+                return []
+            raise GitHubError(f"GitHub error {e.code} for {path}")
+        except urllib.error.URLError as e:
+            raise GitHubError(f"Cannot reach GitHub ({e.reason}). Check your internet connection.")
+        if not paginate:
+            return data
+        items.extend(data)
+        m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        url = m.group(1) if m else None
+        pages += 1
+    return items
+
+
+def connect_github(account_id, token, api=GITHUB_API):
+    """Verify the token, remember the login (encrypted token) and add GitHub's noreply emails."""
+    token = token.strip()
+    if not token:
+        raise ValueError("Paste a GitHub token.")
+    me = _gh(api, token, "/user")
+    cfg = load_config()
+    a = get_account(account_id, cfg)
+    for other in cfg["accounts"]:
+        g = other.get("github")
+        if other["id"] != account_id and g and g["login"].lower() == me["login"].lower() and g["api"] == api:
+            raise ValueError(f"GitHub user {me['login']} is already connected to '{other['label']}'.")
+    a["github"] = {"login": me["login"], "api": api.rstrip("/"), "token_enc": encrypt_token(token)}
+    extra = [f"{me['id']}+{me['login']}@users.noreply.github.com".lower(),
+             f"{me['login']}@users.noreply.github.com".lower()]
+    if me.get("email"):
+        extra.insert(0, me["email"].lower())
+    a["emails"] = _clean_emails(a.get("emails", []) + extra)
+    save_config(cfg)
+    return me["login"]
+
+
+def disconnect_github(account_id):
+    cfg = load_config()
+    get_account(account_id, cfg)["github"] = None
+    save_config(cfg)
+
+
+def _account_token(a):
+    g = a.get("github")
+    if not g:
+        raise GitHubError(f"Account '{a['label']}' is not connected to GitHub.")
+    return g["api"], decrypt_token(g["token_enc"])
+
+
+def list_github_repos(account_id):
+    a = get_account(account_id)
+    api, token = _account_token(a)
+    repos = _gh(api, token, "/user/repos", {"per_page": 100, "sort": "pushed",
+                                             "affiliation": "owner,collaborator,organization_member"},
+                paginate=True)
+    return [{"full_name": r["full_name"], "private": r["private"], "pushed_at": (r.get("pushed_at") or "")[:10]}
+            for r in repos]
+
+
+def scan_github(project, since, account):
+    api, token = _account_token(account)
+    login = (account.get("github") or {}).get("login")
+    if not login:
+        raise GitHubError(f"Account '{account['label']}' is not connected to GitHub.")
+    idents = [login] + [e for e in account.get("emails", []) if "@" in e]
+    commits, pushes = {}, []
+    for repo in project["repos"]:
+        for who in idents:
+            for it in _gh(api, token, f"/repos/{repo}/commits",
+                          {"since": f"{since}T00:00:00Z", "author": who, "per_page": 100}, paginate=True):
+                if len(it.get("parents", [])) > 1 or it["sha"] in commits:
+                    continue
+                c = it["commit"]
+                when = dt.datetime.fromisoformat(c["author"]["date"].replace("Z", "+00:00")).astimezone()
+                subject = " ".join((c.get("message") or "").splitlines()[0].split()) if c.get("message") else ""
+                commits[it["sha"]] = (repo, it["sha"], it["sha"][:7], (c["author"].get("email") or "").lower(),
+                                      when.strftime("%Y-%m-%d"), when.strftime("%H:%M"), subject)
+    wanted = {r.lower() for r in project["repos"]}
+    for ev in _gh(api, token, f"/users/{login}/events", {"per_page": 100}, paginate=True, max_pages=3):
+        if ev.get("type") != "PushEvent" or ev["repo"]["name"].lower() not in wanted:
+            continue
+        when = dt.datetime.fromisoformat(ev["created_at"].replace("Z", "+00:00")).astimezone()
+        branch = (ev["payload"].get("ref") or "").replace("refs/heads/", "")
+        pushes.append((ev["repo"]["name"], branch, (ev["payload"].get("head") or "")[:10],
+                       when.strftime("%Y-%m-%d"), when.strftime("%H:%M")))
+    return list(commits.values()), pushes
+
+
+# ---------------------------------------------------------------- projects
+def add_project(name, path, emails=None):
+    """Track a local folder. emails=None/[] means 'count commits from all my accounts'."""
+    cfg = load_config()
+    path = os.path.normpath(path)
+    name = name.strip()
+    if any(p.get("type") == "local" and os.path.normcase(p["path"]) == os.path.normcase(path)
+           for p in cfg["projects"]):
+        raise ValueError("This folder is already added.")
+    _check_name(cfg, name)
+    repos = find_repos(path)
+    if not repos:
+        raise ValueError("No git repository found in this folder (or 2 levels below it).")
+    cfg["projects"].append({"name": name, "type": "local", "path": path, "emails": _clean_emails(emails)})
+    save_config(cfg)
+    return repos, project_emails(cfg["projects"][-1], cfg)
+
+
+def add_github_project(name, account_id, repos):
+    cfg = load_config()
+    name = name.strip()
+    _check_name(cfg, name)
+    get_account(account_id, cfg)
+    if not repos:
+        raise ValueError("Pick at least one repository.")
+    cfg["projects"].append({"name": name, "type": "github", "account": account_id, "repos": list(repos)})
+    save_config(cfg)
+
+
+def _check_name(cfg, name):
+    if not name:
+        raise ValueError("Give the project a name.")
+    if any(p["name"].lower() == name.lower() for p in cfg["projects"]):
+        raise ValueError("A project with this name already exists.")
+
+
+def remove_project(name, delete_data=False):
+    cfg = load_config()
+    cfg["projects"] = [p for p in cfg["projects"] if p["name"] != name]
+    save_config(cfg)
+    if delete_data:
+        with db() as c:
+            c.execute("DELETE FROM commits WHERE project=?", (name,))
+            c.execute("DELETE FROM pushes WHERE project=?", (name,))
+
+
 def update_project_emails(name, emails):
     cfg = load_config()
     for p in cfg["projects"]:
         if p["name"] == name:
-            p["emails"] = emails
+            p["emails"] = _clean_emails(emails)
     save_config(cfg)
+    with db() as c:  # rescanned on next update with the new filter
+        c.execute("DELETE FROM commits WHERE project=?", (name,))
 
 
-# ---------------------------------------------------------------- git
+def project_emails(p, cfg=None):
+    """Emails whose commits count for a local project: its own list, else all accounts."""
+    return p.get("emails") or all_account_emails(cfg)
+
+
+def project_source(p, cfg=None):
+    if p.get("type") == "github":
+        try:
+            label = get_account(p["account"], cfg)["label"]
+        except ValueError:
+            label = "?"
+        return f"GitHub ({label}): " + ", ".join(p["repos"])
+    return p["path"]
+
+
+def project_counting(p, cfg=None):
+    if p.get("type") == "github":
+        try:
+            a = get_account(p["account"], cfg)
+            return f"{a['github']['login'] if a.get('github') else '(disconnected)'} + {len(a['emails'])} email(s)"
+        except ValueError:
+            return "(account removed)"
+    return ", ".join(p["emails"]) if p.get("emails") else "All my accounts"
+
+
+# ---------------------------------------------------------------- git (local)
 def git(repo, *args):
-    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
-                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    cmd = ["git"] + (["-C", repo] if repo else []) + list(args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           creationflags=NO_WINDOW, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except FileNotFoundError:
+        return ""
     return r.stdout if r.returncode == 0 else ""
 
 
@@ -109,7 +412,7 @@ def find_repos(path, depth=2):
         if d == 0:
             return
         try:
-            entries = os.scandir(p)
+            entries = list(os.scandir(p))
         except OSError:
             return
         for e in entries:
@@ -163,11 +466,30 @@ def scan_repo(repo, since, emails):
 def db():
     c = sqlite3.connect(DB)
     c.execute("""CREATE TABLE IF NOT EXISTS commits(project TEXT, repo TEXT, hash TEXT, short TEXT,
-                 email TEXT, date TEXT, time TEXT, subject TEXT, PRIMARY KEY(repo, hash))""")
+                 email TEXT, date TEXT, time TEXT, subject TEXT, PRIMARY KEY(project, repo, hash))""")
     c.execute("""CREATE TABLE IF NOT EXISTS pushes(project TEXT, repo TEXT, branch TEXT, hash TEXT,
-                 date TEXT, time TEXT, PRIMARY KEY(repo, branch, date, time, hash))""")
+                 date TEXT, time TEXT, PRIMARY KEY(project, repo, branch, date, time, hash))""")
     c.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+    _migrate_keys(c)
     return c
+
+
+def _migrate_keys(c):
+    """v1 keyed rows by repo only; two projects with a same-named repo collided. Re-key by project."""
+    if c.execute("SELECT v FROM meta WHERE k='schema'").fetchone():
+        return
+    for table, cols in (("commits", "project TEXT, repo TEXT, hash TEXT, short TEXT, email TEXT, date TEXT, "
+                                    "time TEXT, subject TEXT, PRIMARY KEY(project, repo, hash)"),
+                        ("pushes", "project TEXT, repo TEXT, branch TEXT, hash TEXT, date TEXT, time TEXT, "
+                                   "PRIMARY KEY(project, repo, branch, date, time, hash)")):
+        pk = [r[1] for r in c.execute(f"PRAGMA table_info({table})") if r[5]]
+        if "project" not in pk:
+            c.execute(f"ALTER TABLE {table} RENAME TO {table}_v1")
+            c.execute(f"CREATE TABLE {table}({cols})")
+            c.execute(f"INSERT OR IGNORE INTO {table} SELECT * FROM {table}_v1")
+            c.execute(f"DROP TABLE {table}_v1")
+    c.execute("INSERT OR REPLACE INTO meta VALUES('schema', '2')")
+    c.commit()
 
 
 def update_all(log=print):
@@ -175,26 +497,39 @@ def update_all(log=print):
     totals = {}
     with db() as c:
         for p in cfg["projects"]:
-            emails = [e.lower() for e in p.get("emails", [])]
-            n_c = n_p = 0
-            if not os.path.isdir(p["path"]):
-                log(f"[{p['name']}] folder missing: {p['path']}")
+            try:
+                if p.get("type") == "github":
+                    commits, pushes = scan_github(p, cfg["since"], get_account(p["account"], cfg))
+                else:
+                    commits, pushes = _scan_local_project(p, cfg)
+            except (GitHubError, ValueError, RuntimeError) as e:
+                log(f"[{p['name']}] skipped: {e}")
+                totals[p["name"]] = (0, 0, str(e))
                 continue
-            for repo in find_repos(p["path"]):
-                rel = os.path.relpath(repo, p["path"])
-                rel = os.path.basename(p["path"]) if rel == "." else rel.replace("\\", "/")
-                commits, pushes = scan_repo(repo, cfg["since"], emails)
-                c.executemany("INSERT OR IGNORE INTO commits VALUES(?,?,?,?,?,?,?,?)",
-                              [(p["name"], rel, *x) for x in commits])
-                c.executemany("INSERT OR IGNORE INTO pushes VALUES(?,?,?,?,?,?)",
-                              [(p["name"], rel, x[1], x[0], x[2], x[3]) for x in pushes])
-                n_c += len(commits)
-                n_p += len(pushes)
-            totals[p["name"]] = (n_c, n_p)
-            log(f"[{p['name']}] {n_c} commits, {n_p} pushes found")
+            c.executemany("INSERT OR IGNORE INTO commits VALUES(?,?,?,?,?,?,?,?)",
+                          [(p["name"], *x) for x in commits])
+            c.executemany("INSERT OR IGNORE INTO pushes VALUES(?,?,?,?,?,?)",
+                          [(p["name"], *x) for x in pushes])
+            totals[p["name"]] = (len(commits), len(pushes), None)
+            log(f"[{p['name']}] {len(commits)} commits, {len(pushes)} pushes found")
         c.execute("INSERT OR REPLACE INTO meta VALUES('last_update', ?)",
                   (dt.datetime.now().strftime("%Y-%m-%d %H:%M"),))
     return totals
+
+
+def _scan_local_project(p, cfg):
+    if not os.path.isdir(p["path"]):
+        raise ValueError(f"folder missing: {p['path']}")
+    repos = find_repos(p["path"])
+    emails = project_emails(p, cfg) or detect_emails(repos)
+    commits, pushes = [], []
+    for repo in repos:
+        rel = os.path.relpath(repo, p["path"])
+        rel = os.path.basename(p["path"]) if rel == "." else rel.replace("\\", "/")
+        cs, ps = scan_repo(repo, cfg["since"], emails)
+        commits += [(rel, *x) for x in cs]
+        pushes += [(rel, x[1], x[0], x[2], x[3]) for x in ps]
+    return commits, pushes
 
 
 def last_update():
@@ -327,38 +662,95 @@ def remove_schedule():
 
 
 # ---------------------------------------------------------------- CLI
-if __name__ == "__main__":
+def _cli():
     import argparse
+    import getpass
     ap = argparse.ArgumentParser(prog="tracker_core.py", description=f"{APP_NAME} command line")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    a = sub.add_parser("add", help="track a project folder")
-    a.add_argument("path")
-    a.add_argument("--name")
-    a.add_argument("--email", action="append", help="your git email (repeatable); default: auto-detect")
+
+    sub.add_parser("accounts", help="list git accounts")
+    x = sub.add_parser("account-add", help="add a git account (identity)")
+    x.add_argument("label")
+    x.add_argument("--email", action="append", required=True, help="email you commit with (repeatable)")
+    x = sub.add_parser("account-remove", help="remove a git account")
+    x.add_argument("account_id")
+    x = sub.add_parser("github-connect", help="connect an account to GitHub (asks for a token)")
+    x.add_argument("account_id")
+    x.add_argument("--api", default=GITHUB_API, help="API URL, for GitHub Enterprise")
+    x = sub.add_parser("github-disconnect", help="forget an account's GitHub token")
+    x.add_argument("account_id")
+    x = sub.add_parser("github-repos", help="list repos an account can read")
+    x.add_argument("account_id")
+
+    x = sub.add_parser("add", help="track a local project folder")
+    x.add_argument("path")
+    x.add_argument("--name")
+    x.add_argument("--email", action="append", help="only count these emails (default: all my accounts)")
+    x = sub.add_parser("add-github", help="track GitHub repos through a connected account")
+    x.add_argument("name")
+    x.add_argument("--account", required=True)
+    x.add_argument("--repo", action="append", required=True, help="owner/name (repeatable)")
     sub.add_parser("list", help="list tracked projects")
+    x = sub.add_parser("remove", help="stop tracking a project")
+    x.add_argument("name")
+    x.add_argument("--delete-data", action="store_true")
     sub.add_parser("update", help="rescan all projects now")
-    e = sub.add_parser("export", help="write an Excel timesheet")
-    e.add_argument("out")
-    e.add_argument("--from", dest="date_from", required=True)
-    e.add_argument("--to", dest="date_to", default=dt.date.today().isoformat())
-    e.add_argument("--project")
-    s = sub.add_parser("schedule", help="set the daily update time (HH:MM)")
-    s.add_argument("time")
+    x = sub.add_parser("export", help="write an Excel timesheet")
+    x.add_argument("out")
+    x.add_argument("--from", dest="date_from", required=True)
+    x.add_argument("--to", dest="date_to", default=dt.date.today().isoformat())
+    x.add_argument("--project")
+    x = sub.add_parser("since", help="set the start date (YYYY-MM-DD)")
+    x.add_argument("date")
+    x = sub.add_parser("schedule", help="set the daily update time (HH:MM)")
+    x.add_argument("time")
     sub.add_parser("unschedule", help="remove the daily update task")
-    args = ap.parse_args()
-    if args.cmd == "add":
-        name = args.name or os.path.basename(os.path.normpath(args.path))
-        repos, emails = add_project(name, args.path, [x.lower() for x in args.email or []])
-        print(f"Added '{name}': {len(repos)} repo(s), emails: {', '.join(emails) or '(everyone)'}")
-    elif args.cmd == "list":
-        for p in load_config()["projects"]:
-            print(f"{p['name']}\t{p['path']}\t{', '.join(p.get('emails', []))}")
-    elif args.cmd == "update":
+
+    a = ap.parse_args()
+    if a.cmd == "accounts":
+        for acc in load_config()["accounts"]:
+            gh = acc["github"]["login"] if acc.get("github") else "-"
+            print(f"{acc['id']}\t{acc['label']}\tGitHub: {gh}\t{', '.join(acc['emails'])}")
+    elif a.cmd == "account-add":
+        acc = add_account(a.label, a.email)
+        print(f"Added account {acc['id']} ({acc['label']})")
+    elif a.cmd == "account-remove":
+        remove_account(a.account_id)
+    elif a.cmd == "github-connect":
+        print(f"Connected as {connect_github(a.account_id, getpass.getpass('GitHub token: '), a.api)}")
+    elif a.cmd == "github-disconnect":
+        disconnect_github(a.account_id)
+    elif a.cmd == "github-repos":
+        for r in list_github_repos(a.account_id):
+            print(f"{r['full_name']}\t{'private' if r['private'] else 'public'}\tlast push {r['pushed_at']}")
+    elif a.cmd == "add":
+        name = a.name or os.path.basename(os.path.normpath(a.path))
+        repos, emails = add_project(name, a.path, a.email)
+        print(f"Added '{name}': {len(repos)} repo(s), counting: {', '.join(emails) or '(everyone)'}")
+    elif a.cmd == "add-github":
+        add_github_project(a.name, a.account, a.repo)
+        print(f"Added '{a.name}': {len(a.repo)} GitHub repo(s)")
+    elif a.cmd == "list":
+        cfg = load_config()
+        for p in cfg["projects"]:
+            print(f"{p['name']}\t{project_source(p, cfg)}\t{project_counting(p, cfg)}")
+    elif a.cmd == "remove":
+        remove_project(a.name, a.delete_data)
+    elif a.cmd == "update":
         update_all()
-    elif args.cmd == "export":
-        print(f"{export_excel(args.out, args.date_from, args.date_to, args.project)} day-rows -> {args.out}")
-    elif args.cmd == "schedule":
-        set_schedule(args.time)
-        print(f"Daily update at {args.time}")
-    elif args.cmd == "unschedule":
+    elif a.cmd == "export":
+        print(f"{export_excel(a.out, a.date_from, a.date_to, a.project)} day-rows -> {a.out}")
+    elif a.cmd == "since":
+        set_since(a.date)
+    elif a.cmd == "schedule":
+        set_schedule(a.time)
+        print(f"Daily update at {a.time}")
+    elif a.cmd == "unschedule":
         remove_schedule()
+
+
+if __name__ == "__main__":
+    try:
+        _cli()
+    except (ValueError, GitHubError, RuntimeError) as e:
+        sys.exit(f"Error: {e}")
