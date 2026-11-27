@@ -61,7 +61,7 @@
 Open **PowerShell** and run:
 
 ```powershell
-git clone https://github.com/codewithvj-dev/VJ-TimesheetTracker-.git "$HOME\VJ-TimesheetTracker"
+git clone https://github.com/codewithvj-dev/VJ-TimesheetTracker.git "$HOME\VJ-TimesheetTracker"
 cd "$HOME\VJ-TimesheetTracker"
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
